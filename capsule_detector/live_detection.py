@@ -190,10 +190,12 @@ class LiveDetector:
             # Share the latest frame with the detection thread.
             self._frame_slot.put(frame)
 
-            # Draw last known results onto the CURRENT (freshest) frame.
-            # Drawing is always fast (< 1 ms) — never blocks the display.
-            results   = self._result_slot.get()
-            annotated = draw_results(frame, _dicts_to_results(results))
+            # Always start from a fresh copy of the live frame so the display
+            # is never blank when no detections have run yet.
+            results  = self._result_slot.get()
+            annotated = frame.copy()
+            if len(results) > 0:
+                annotated = draw_results(annotated, _dicts_to_results(results))
             _draw_hud(
                 annotated,
                 n_capsules   = len(results),
