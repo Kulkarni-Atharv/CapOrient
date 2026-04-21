@@ -149,13 +149,18 @@ class LiveDetector:
         # ── configure Picamera2 ───────────────────────────────────
         picam2 = Picamera2(camera_num=self._camera_num)
 
-        # RGB888 gives a plain (H, W, 3) uint8 array — easy to convert to BGR.
-        # preview_configuration keeps CPU + memory usage low vs. still capture.
+        # XRGB8888 is universally supported across all Pi Camera models.
+        # capture_array() with this format returns shape (H, W, 4) where
+        # the in-memory byte order is B, G, R, X — convert with BGRA2BGR.
         cam_cfg = picam2.create_preview_configuration(
-            main={"size": (1280, 720), "format": "RGB888"},
+            main={"size": (640, 480), "format": "XRGB8888"},
         )
         picam2.configure(cam_cfg)
         picam2.start()
+
+        # Wait for the sensor auto-exposure and white-balance to stabilise.
+        # Without this the first frames are completely black.
+        time.sleep(2)
         # ─────────────────────────────────────────────────────────
 
         self._running = True
@@ -184,9 +189,10 @@ class LiveDetector:
         while True:
             # capture_array() grabs the latest completed frame from the
             # Picamera2 buffer — non-blocking and always fresh.
-            # Picamera2 returns RGB; convert to BGR for OpenCV.
-            rgb   = picam2.capture_array()
-            frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            # XRGB8888 is stored as BGRX bytes in memory, so drop the X
+            # channel with BGRA2BGR (OpenCV treats the 4th byte as alpha).
+            bgra  = picam2.capture_array("main")
+            frame = cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
 
             # Share the latest frame with the detection thread.
             self._frame_slot.put(frame)
