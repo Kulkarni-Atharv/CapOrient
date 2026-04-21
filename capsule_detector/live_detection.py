@@ -53,7 +53,6 @@ from capsule_detector.edge_detection import build_edge_map
 from capsule_detector.models         import CapsuleResult
 from capsule_detector.orientation    import measure_orientation
 from capsule_detector.postprocessing import nms
-from capsule_detector.preprocessing  import preprocess_frame
 from capsule_detector.segmentation   import segment_capsules
 from capsule_detector.visualization  import draw_results
 
@@ -285,7 +284,7 @@ def _run_pipeline(frame: np.ndarray) -> List[dict]:
     pw, ph = _process_size(w_orig, h_orig)
 
     small     = cv2.resize(frame, (pw, ph), interpolation=cv2.INTER_AREA)
-    _, gray_p = preprocess_frame(small)   # cheap Gaussian blur + grayscale
+    gray_p = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)  # bypass preprocessing; raw gray only
 
     edge_map = build_edge_map(gray_p)
     masks    = segment_capsules(gray_p, edge_map)
