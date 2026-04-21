@@ -1,12 +1,20 @@
 """
 Live capsule orientation detection — time-based trigger.
 
+Camera backend
+--------------
+Uses Picamera2 (libcamera stack) which is the only correct way to access
+the Raspberry Pi Camera Module on Pi OS Bullseye / Bookworm.
+cv2.VideoCapture cannot open CSI cameras on these OS versions.
+
+Install:  sudo apt install -y python3-picamera2
+
 How it works
 ------------
 Two threads run concurrently:
 
   Main thread  (display loop)
-    • Reads frames from the camera as fast as possible.
+    • Reads frames from Picamera2 as fast as possible.
     • Shares each frame with the detection thread via _FrameSlot.
     • Draws the LAST STORED detection results on the freshest frame.
     • Handles keyboard: Q = quit, D = immediate detection.
@@ -23,7 +31,7 @@ Why Event.wait(timeout) instead of time.sleep()
 ------------------------------------------------
 time.sleep(30) cannot be interrupted mid-sleep.
 Event.wait(timeout=remaining) releases the GIL and returns instantly when
-the event is set — so a 'D' keypress always takes effect immediately
+the event is set — so a D keypress always takes effect immediately
 regardless of where in the 30 s window it arrives.
 
 CPU cost while idle: essentially zero — the background thread is
@@ -38,6 +46,7 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
+from picamera2 import Picamera2           # pip: sudo apt install python3-picamera2
 
 import config
 from capsule_detector.edge_detection import build_edge_map
@@ -100,32 +109,33 @@ class _ResultSlot:
 
 class LiveDetector:
     """
-    Runs capsule orientation detection on a live camera feed.
-    Detection fires on a fixed time interval or on a manual 'D' keypress.
+    Runs capsule orientation detection on a live Picamera2 feed.
+    Detection fires on a fixed time interval or on a manual D keypress.
     """
 
     def __init__(self, camera_index: int = config.LIVE_CAMERA_INDEX):
-        self._camera_index = camera_index
+        # camera_index maps directly to Picamera2(camera_num=...)
+        self._camera_num   = camera_index
         self._frame_slot   = _FrameSlot()
         self._result_slot  = _ResultSlot()
 
         # ── time-based trigger ────────────────────────────────────
-        # Set to zero so the very first frame triggers detection immediately
-        # instead of waiting a full interval before producing any output.
+        # Initialise to 0 so detection fires immediately on the first frame
+        # rather than waiting a full interval before showing any result.
         self._last_detection_time: float = 0.0
 
-        # threading.Event used for the manual 'D' trigger.
-        # Detection thread calls  .wait(timeout=remaining_seconds).
-        # Display thread calls    .set()  when D is pressed.
-        # Detection thread calls  .clear() right after waking.
+        # threading.Event used for the manual D trigger.
+        #   Detection thread : .wait(timeout=remaining_seconds)
+        #   Display thread   : .set()  on D keypress
+        #   Detection thread : .clear() immediately after waking
         self._manual_trigger = threading.Event()
         # ─────────────────────────────────────────────────────────
 
-        self._running      = False
+        self._running     = False
         self._proc_thread: Optional[threading.Thread] = None
 
         # Stats written by detection thread, read by display thread.
-        # Simple float/bool writes are GIL-atomic; no extra lock needed.
+        # Simple float/bool writes are GIL-atomic; no lock needed.
         self._proc_ms:      float = 0.0   # duration of last detection pass
         self._is_detecting: bool  = False  # True while pipeline is running
 
@@ -133,18 +143,20 @@ class LiveDetector:
 
     def run(self) -> None:
         """
-        Open the camera, start the background detection thread, and run
-        the display loop.  Blocks until the user presses Q or camera fails.
+        Initialise Picamera2, start the background detection thread, and
+        run the display loop.  Blocks until the user presses Q.
         """
-        cap = cv2.VideoCapture(self._camera_index)
-        if not cap.isOpened():
-            raise RuntimeError(
-                f"Cannot open camera {self._camera_index}. "
-                "Check the device is connected and not in use."
-            )
+        # ── configure Picamera2 ───────────────────────────────────
+        picam2 = Picamera2(camera_num=self._camera_num)
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  720)
+        # RGB888 gives a plain (H, W, 3) uint8 array — easy to convert to BGR.
+        # preview_configuration keeps CPU + memory usage low vs. still capture.
+        cam_cfg = picam2.create_preview_configuration(
+            main={"size": (1280, 720), "format": "RGB888"},
+        )
+        picam2.configure(cam_cfg)
+        picam2.start()
+        # ─────────────────────────────────────────────────────────
 
         self._running = True
         self._proc_thread = threading.Thread(
@@ -155,31 +167,32 @@ class LiveDetector:
         self._proc_thread.start()
 
         try:
-            self._display_loop(cap)
+            self._display_loop(picam2)
         finally:
             self._running = False
-            # Wake the detection thread so it notices _running=False and exits
-            # cleanly rather than sleeping until the next interval.
+            # Wake the sleeping detection thread so it can exit cleanly
+            # instead of waiting until the next interval timeout.
             self._manual_trigger.set()
-            cap.release()
+            picam2.stop()
             cv2.destroyAllWindows()
 
     # ── display loop  (main thread) ───────────────────────────
 
-    def _display_loop(self, cap: cv2.VideoCapture) -> None:
+    def _display_loop(self, picam2: Picamera2) -> None:
         wait_ms = max(1, int(1000 / config.LIVE_DISPLAY_FPS))
 
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("Camera read failed — stopping.", file=sys.stderr)
-                break
+            # capture_array() grabs the latest completed frame from the
+            # Picamera2 buffer — non-blocking and always fresh.
+            # Picamera2 returns RGB; convert to BGR for OpenCV.
+            rgb   = picam2.capture_array()
+            frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
             # Share the latest frame with the detection thread.
             self._frame_slot.put(frame)
 
             # Draw last known results onto the CURRENT (freshest) frame.
-            # This never blocks — drawing is always fast (< 1 ms).
+            # Drawing is always fast (< 1 ms) — never blocks the display.
             results   = self._result_slot.get()
             annotated = draw_results(frame, _dicts_to_results(results))
             _draw_hud(
@@ -202,7 +215,7 @@ class LiveDetector:
 
             elif key == ord("d") and not self._is_detecting:
                 # Manual trigger: wake the detection thread immediately.
-                # The thread will clear the event itself after waking.
+                # The detection thread clears the event after waking.
                 self._manual_trigger.set()
 
     # ── detection loop  (background thread) ───────────────────
@@ -210,29 +223,29 @@ class LiveDetector:
     def _detection_loop(self) -> None:
         while self._running:
 
-            # ── compute sleep duration until next scheduled detection ──
+            # ── compute how long to sleep until next scheduled detection ──
             elapsed_since_last = time.time() - self._last_detection_time
             remaining = config.LIVE_DETECTION_INTERVAL - elapsed_since_last
 
             if remaining > 0:
                 # Block here — zero CPU cost — until either:
-                #   (a) the remaining time elapses naturally  → timed trigger
-                #   (b) the display thread calls .set()       → manual trigger
+                #   (a) remaining seconds elapse naturally  → timed trigger
+                #   (b) display thread calls .set()         → manual trigger (D key)
                 self._manual_trigger.wait(timeout=remaining)
 
-            # Consume the event immediately so a stale set() from a previous
-            # keypress does not cause an extra detection on the next iteration.
+            # Consume the event so a stale set() from a previous D keypress
+            # does not cause an unexpected extra detection next iteration.
             self._manual_trigger.clear()
 
-            # Exit check — run() may have set _running=False and fired the
-            # event just to unblock this thread.
+            # run() may have set _running=False and fired the event just to
+            # unblock this thread — check before doing any real work.
             if not self._running:
                 break
 
-            # ── grab the latest camera frame ──────────────────────────
+            # ── grab the latest frame from the display thread ─────────
             frame = self._frame_slot.get()
             if frame is None:
-                # Camera not ready yet; wait briefly and retry.
+                # Picamera2 hasn't produced a frame yet; retry shortly.
                 time.sleep(0.1)
                 continue
 
@@ -245,35 +258,33 @@ class LiveDetector:
             self._proc_ms      = (time.perf_counter() - t0) * 1000
             self._is_detecting = False
 
-            # Store results and reset the 30 s interval clock.
+            # Persist results and reset the interval clock.
             self._result_slot.put(results)
-            self._last_detection_time = time.time()   # ← resets the interval
+            self._last_detection_time = time.time()   # ← resets the 30 s timer
 
     # ── internal helper ───────────────────────────────────────
 
     def _seconds_until_next(self) -> float:
-        """How many seconds until the next scheduled detection (min 0)."""
+        """Seconds remaining until the next scheduled detection (minimum 0)."""
         elapsed = time.time() - self._last_detection_time
         return max(0.0, config.LIVE_DETECTION_INTERVAL - elapsed)
 
 
 # ─────────────────────────────────────────────────────────────
-# Detection pipeline (module-level, no class state)
+# Detection pipeline  (module-level, stateless)
 # ─────────────────────────────────────────────────────────────
 
 def _run_pipeline(frame: np.ndarray) -> List[dict]:
     """
     Full detection pass on a single BGR frame.
-
-    Downscales to LIVE_PROCESS_WIDTH before running the pipeline,
-    then scales all result coordinates back to the original frame size.
+    Downscales to LIVE_PROCESS_WIDTH, runs the pipeline, then scales all
+    result coordinates back to the original frame dimensions.
     """
     h_orig, w_orig = frame.shape[:2]
     pw, ph = _process_size(w_orig, h_orig)
 
-    # Resize for faster processing — keeps aspect ratio.
-    small       = cv2.resize(frame, (pw, ph), interpolation=cv2.INTER_AREA)
-    _, gray_p   = preprocess_frame(small)   # lightweight Gaussian blur + grayscale
+    small     = cv2.resize(frame, (pw, ph), interpolation=cv2.INTER_AREA)
+    _, gray_p = preprocess_frame(small)   # cheap Gaussian blur + grayscale
 
     edge_map = build_edge_map(gray_p)
     masks    = segment_capsules(gray_p, edge_map)
@@ -285,13 +296,12 @@ def _run_pipeline(frame: np.ndarray) -> List[dict]:
     ]
     results = nms(raw)
 
-    # Scale bounding boxes and centres back to original frame coordinates.
     _scale_results(results, sx=w_orig / pw, sy=h_orig / ph)
     return [asdict(r) for r in results]
 
 
 def _process_size(w: int, h: int) -> Tuple[int, int]:
-    """(pw, ph) at LIVE_PROCESS_WIDTH with original aspect ratio."""
+    """Return (pw, ph) at LIVE_PROCESS_WIDTH, preserving aspect ratio."""
     pw = min(w, config.LIVE_PROCESS_WIDTH)
     ph = max(1, int(round(h * pw / w)))
     return pw, ph
@@ -299,7 +309,7 @@ def _process_size(w: int, h: int) -> Tuple[int, int]:
 
 def _scale_results(results: List[CapsuleResult], sx: float, sy: float) -> None:
     """Scale all spatial fields from process-space to display-space in-place."""
-    s_len = (sx + sy) / 2   # uniform scale for axis lengths
+    s_len = (sx + sy) / 2
     for r in results:
         r.bounding_box[0] *= sx;  r.bounding_box[1] *= sy
         r.bounding_box[2] *= sx;  r.bounding_box[3] *= sy
@@ -334,15 +344,15 @@ def _draw_hud(
 
     lines = [
         f"Capsules : {n_capsules}",
-        f"Last det : {proc_ms:.0f} ms" if proc_ms > 0 else "Last det : –",
+        f"Last det : {proc_ms:.0f} ms" if proc_ms > 0 else "Last det : --",
         trigger_line,
         "Q = quit",
     ]
 
     for i, text in enumerate(lines):
         y = 30 + i * 26
-        # Black outline (thickness 3) then coloured text (thickness 1) on top.
+        # Black outline (thickness 3) then cyan text (thickness 1) on top.
         cv2.putText(frame, text, (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0),       3, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0),     3, cv2.LINE_AA)
         cv2.putText(frame, text, (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255),   1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 1, cv2.LINE_AA)
