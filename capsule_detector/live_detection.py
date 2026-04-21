@@ -46,9 +46,9 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
-from picamera2 import Picamera2           # pip: sudo apt install python3-picamera2
 
 import config
+from capsule_detector.camera_manager import CameraManager
 from capsule_detector.edge_detection import build_edge_map
 from capsule_detector.models         import CapsuleResult
 from capsule_detector.orientation    import measure_orientation
@@ -142,17 +142,11 @@ class LiveDetector:
 
     def run(self) -> None:
         """
-        Initialise Picamera2, start the background detection thread, and
+        Initialise CameraManager, start the background detection thread, and
         run the display loop.  Blocks until the user presses Q.
         """
-        picam2 = Picamera2()
-
-        cam_config = picam2.create_preview_configuration(
-            main={"format": "BGR888", "size": (640, 480)}
-        )
-        picam2.configure(cam_config)
-        picam2.start()
-        time.sleep(2)
+        camera = CameraManager()
+        camera.initialize_camera()
 
         self._running = True
         self._proc_thread = threading.Thread(
@@ -163,28 +157,23 @@ class LiveDetector:
         self._proc_thread.start()
 
         try:
-            self._display_loop(picam2)
+            self._display_loop(camera)
         finally:
             self._running = False
-            # Wake the sleeping detection thread so it can exit cleanly
-            # instead of waiting until the next interval timeout.
             self._manual_trigger.set()
-            picam2.stop()
+            camera.close()
             cv2.destroyAllWindows()
 
     # ── display loop  (main thread) ───────────────────────────
 
-    def _display_loop(self, picam2: Picamera2) -> None:
+    def _display_loop(self, camera: CameraManager) -> None:
         wait_ms = max(1, int(1000 / config.LIVE_DISPLAY_FPS))
 
         while True:
-            raw = picam2.capture_array()
-            print(raw.shape)
+            frame = camera.get_frame()
 
-            if raw is None:
+            if frame is None:
                 continue
-
-            frame = raw.copy()
 
             # Share the latest frame with the detection thread.
             self._frame_slot.put(frame)
